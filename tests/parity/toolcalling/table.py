@@ -587,8 +587,8 @@ def peer_status(case: dict, dyn: dict, impl: str) -> tuple[str, bool]:
 
 _TOOL_CALL_MARKUP_RE = re.compile(
     r"</?tool_call|</?tool_calls|<\|tool_call|<\|tool_calls|"
-    r"</?TOOLCALL|TOOL_CALLS|<｜(?:DSML｜)?(?:tool|tool▁call|tool▁calls)|"
-    r"<｜DSML｜|</?minimax:tool_call|</?invoke|</?arg_key|</?arg_value|"
+    r"</?TOOLCALL|TOOL_CALLS|<\uFF5C(?:DSML\uFF5C)?(?:tool|tool▁call|tool▁calls)|"
+    r"<\uFF5CDSML\uFF5C|</?minimax:tool_call|</?invoke|</?arg_key|</?arg_value|"
     r"<\|action_(?:start|end)\|>|<\|plugin\|>"
 )
 

@@ -219,8 +219,11 @@ def test_internlm_split_action_marker_is_colorized_across_stream_chunks() -> Non
     rendered = colorize_stream_deltas(chunks, "internlm")
 
     assert "tt-orphan" not in "".join(rendered)
-    assert re.search(r'<span class="tt-c\d+">&lt;\|action</span>', rendered[0])
-    assert re.search(r'<span class="tt-c\d+">_start\|&gt;</span>', rendered[1])
+    first = re.search(r'<span class="(tt-c\d+)">&lt;\|action</span>', rendered[0])
+    second = re.search(r'<span class="(tt-c\d+)">_start\|&gt;</span>', rendered[1])
+    assert first is not None
+    assert second is not None
+    assert first.group(1) == second.group(1)
 
 
 def _render_html(*extra_args: str) -> str:
