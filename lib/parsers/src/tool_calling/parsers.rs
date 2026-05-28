@@ -40,6 +40,7 @@ pub fn get_tool_parser_map() -> &'static HashMap<&'static str, ToolCallConfig> {
         map.insert("nemotron_deci", ToolCallConfig::nemotron_deci());
         map.insert("llama3_json", ToolCallConfig::llama3_json());
         map.insert("mistral", ToolCallConfig::mistral());
+        map.insert("internlm", ToolCallConfig::internlm());
         map.insert("phi4", ToolCallConfig::phi4());
         map.insert("pythonic", ToolCallConfig::pythonic());
         map.insert("harmony", ToolCallConfig::harmony());
@@ -327,6 +328,7 @@ mod tests {
             "harmony",
             "nemotron_deci",
             "mistral",
+            "internlm",
             "phi4",
             "default",
             "pythonic",
@@ -1187,6 +1189,156 @@ Remember, San Francisco weather can be quite unpredictable, particularly with it
             .unwrap();
         assert_eq!(content, Some(input.to_string()));
         assert!(result.is_empty()); // This model doesn't produce tool calls
+    }
+
+    #[tokio::test]
+    async fn test_internlm_parameterless_action_defaults_to_empty_arguments() {
+        let input = r#"<|action_start|><|plugin|>{"name": "refresh"}<|action_end|>"#;
+        let tools = vec![ToolDefinition {
+            name: "refresh".to_string(),
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": {},
+            })),
+            strict: None,
+        }];
+
+        let (result, content) =
+            try_tool_call_parse(input, &ToolCallConfig::internlm(), Some(&tools))
+                .await
+                .unwrap();
+
+        assert_eq!(content, Some("".to_string()));
+        assert_eq!(result.len(), 1);
+        let (name, args) = extract_name_and_args(result[0].clone());
+        assert_eq!(name, "refresh");
+        assert_eq!(args, serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn test_internlm_malformed_action_does_not_leak_markers() {
+        let tools = vec![ToolDefinition {
+            name: "get_weather".to_string(),
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string"},
+                },
+                "required": ["location"],
+            })),
+            strict: None,
+        }];
+        let cases = [
+            r#"<|action_start|><|plugin|>not json<|action_end|>"#,
+            r#"<|action_start|><|plugin|>{"parameters": {"location": "NYC"}}<|action_end|>"#,
+        ];
+
+        for input in cases {
+            let (result, content) =
+                try_tool_call_parse(input, &ToolCallConfig::internlm(), Some(&tools))
+                    .await
+                    .unwrap();
+
+            assert!(result.is_empty(), "unexpected call for {input:?}");
+            assert_eq!(
+                content,
+                Some("".to_string()),
+                "leaked content for {input:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_internlm_recovers_action_missing_plugin_marker() {
+        let input = r#"<|action_start|>{"name": "get_weather", "parameters": {"location": "NYC"}}<|action_end|>"#;
+
+        let (result, content) = try_tool_call_parse(input, &ToolCallConfig::internlm(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(content, Some("".to_string()));
+        assert_eq!(result.len(), 1);
+        let (name, args) = extract_name_and_args(result[0].clone());
+        assert_eq!(name, "get_weather");
+        assert_eq!(args, serde_json::json!({"location": "NYC"}));
+    }
+
+    #[tokio::test]
+    async fn test_internlm_recovers_action_with_orphan_end_marker() {
+        let input = r#"{"name": "get_weather", "parameters": {"location": "NYC"}}<|action_end|>"#;
+
+        let (result, content) = try_tool_call_parse(input, &ToolCallConfig::internlm(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(content, Some("".to_string()));
+        assert_eq!(result.len(), 1);
+        let (name, args) = extract_name_and_args(result[0].clone());
+        assert_eq!(name, "get_weather");
+        assert_eq!(args, serde_json::json!({"location": "NYC"}));
+    }
+
+    #[tokio::test]
+    async fn test_internlm_recovers_valid_action_after_malformed_prefix() {
+        let tools = vec![ToolDefinition {
+            name: "get_weather".to_string(),
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string"},
+                },
+                "required": ["location"],
+            })),
+            strict: None,
+        }];
+        let input = r#"<|action_start|><|plugin|>not json<|action_end|><|action_start|><|plugin|>{"name": "get_weather", "parameters": {"location": "NYC"}}<|action_end|>"#;
+
+        let (result, content) =
+            try_tool_call_parse(input, &ToolCallConfig::internlm(), Some(&tools))
+                .await
+                .unwrap();
+
+        assert_eq!(content, Some("".to_string()));
+        assert_eq!(result.len(), 1);
+        let (name, args) = extract_name_and_args(result[0].clone());
+        assert_eq!(name, "get_weather");
+        assert_eq!(args, serde_json::json!({"location": "NYC"}));
+    }
+
+    #[tokio::test]
+    async fn test_internlm_multiple_action_blocks() {
+        let input = r#"<|action_start|><|plugin|>{"name": "get_weather", "parameters": {"location": "NYC"}}<|action_end|><|action_start|><|plugin|>{"name": "get_weather", "parameters": {"location": "LA"}}<|action_end|>"#;
+
+        let (result, content) = try_tool_call_parse(input, &ToolCallConfig::internlm(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(content, Some("".to_string()));
+        assert_eq!(result.len(), 2);
+        let (name_0, args_0) = extract_name_and_args(result[0].clone());
+        let (name_1, args_1) = extract_name_and_args(result[1].clone());
+        assert_eq!(name_0, "get_weather");
+        assert_eq!(args_0, serde_json::json!({"location": "NYC"}));
+        assert_eq!(name_1, "get_weather");
+        assert_eq!(args_1, serde_json::json!({"location": "LA"}));
+    }
+
+    #[tokio::test]
+    async fn test_internlm_marker_text_inside_argument_is_data() {
+        let input = r#"<|action_start|><|plugin|>{"name": "run_query", "parameters": {"sql": "SELECT '<|action_start|><|plugin|>not a call<|action_end|>' as marker"}}<|action_end|>"#;
+
+        let (result, content) = try_tool_call_parse(input, &ToolCallConfig::internlm(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(content, Some("".to_string()));
+        assert_eq!(result.len(), 1);
+        let (name, args) = extract_name_and_args(result[0].clone());
+        assert_eq!(name, "run_query");
+        assert_eq!(
+            args,
+            serde_json::json!({"sql": "SELECT '<|action_start|><|plugin|>not a call<|action_end|>' as marker"})
+        );
     }
 
     #[tokio::test]

@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use regex::RegexBuilder;
-use serde_json::value::RawValue;
+use serde_json::{Value, value::RawValue};
 use uuid::Uuid;
 
 use super::super::ToolDefinition;
@@ -31,37 +30,213 @@ pub struct CalledFunctionArguments {
     pub arguments: Box<RawValue>,
 }
 
-// Extract the contents between start and end tokens using regex parsing.
-// Returns a JSON array string if there are multiple matches, otherwise returns the last match directly.
-fn extract_tool_call_content(input: &str, start_token: &str, end_token: &str) -> Option<String> {
-    let escaped_start = regex::escape(start_token);
-    let escaped_end = regex::escape(end_token);
-    let pattern = format!(r"{}(.*?){}", escaped_start, escaped_end);
+#[derive(Debug, serde::Deserialize)]
+pub struct CalledFunctionNameOnly {
+    pub name: String,
+}
 
-    match RegexBuilder::new(&pattern)
-        .dot_matches_new_line(true)
-        .build()
-    {
-        Ok(regex) => {
-            // Get all matches and take the last one for now. TODO: Handle multiple tool calls
-            let matches: Vec<_> = regex
-                .captures_iter(input)
-                .filter_map(|captures| captures.get(1))
-                .map(|m| m.as_str().trim().to_string())
-                .collect();
-            if !matches.is_empty() {
-                // If only one match, return it directly, otherwise return as a JSON array string
-                if matches.len() == 1 {
-                    // Return the last match directly
-                    return Some(matches.last().unwrap().clone());
-                } else {
-                    // Join the matches into a JSON array string
-                    return Some(format!("[{}]", matches.join(",")));
+fn tool_allows_empty_arguments(name: &str, tools: Option<&[ToolDefinition]>) -> bool {
+    let Some(tools) = tools else {
+        return false;
+    };
+    tools
+        .iter()
+        .any(|tool| tool.name == name && schema_allows_empty_arguments(tool.parameters.as_ref()))
+}
+
+fn schema_allows_empty_arguments(schema: Option<&Value>) -> bool {
+    let Some(schema) = schema else {
+        return true;
+    };
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|required| required.is_empty())
+        .unwrap_or(true)
+}
+
+fn contains_marker_token(text: &str, config: &JsonParserConfig) -> bool {
+    config
+        .tool_call_start_tokens
+        .iter()
+        .chain(config.tool_call_end_tokens.iter())
+        .chain(config.tool_call_sentinel_tokens.iter())
+        .any(|token| !token.is_empty() && text.contains(token))
+}
+
+fn strip_trailing_end_tokens(input: &str, end_tokens: &[String]) -> Option<String> {
+    let mut trimmed = input.trim_end();
+    let mut changed = false;
+
+    loop {
+        let mut matched = false;
+        for token in end_tokens.iter().filter(|token| !token.is_empty()) {
+            if let Some(prefix) = trimmed.strip_suffix(token.as_str()) {
+                trimmed = prefix.trim_end();
+                changed = true;
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            break;
+        }
+    }
+
+    if changed && (trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+// Extract complete JSON values after each start token. This deliberately uses a
+// JSON parser instead of a `start(.*?)end` regex so marker-looking text inside a
+// JSON string is treated as data, and so a malformed wrapper can be skipped
+// before resynchronizing on a later valid wrapper.
+fn extract_tool_call_content(
+    input: &str,
+    start_token: &str,
+    end_token: &str,
+    allow_eof_recovery: bool,
+) -> Option<String> {
+    let mut cursor = 0;
+    let mut values: Vec<String> = Vec::new();
+    let mut saw_start = false;
+    let mut saw_closed_wrapper = false;
+    let mut saw_unclosed_wrapper = false;
+
+    while let Some(rel_start) = input[cursor..].find(start_token) {
+        saw_start = true;
+        let start_pos = cursor + rel_start;
+        let body_pos = start_pos + start_token.len();
+        let body = &input[body_pos..];
+        let trimmed_body = body.trim_start();
+        let leading_ws = body.len() - trimmed_body.len();
+        let json_pos = body_pos + leading_ws;
+
+        if !(trimmed_body.starts_with('{') || trimmed_body.starts_with('[')) {
+            match next_wrapper_boundary(input, body_pos, start_token, end_token) {
+                WrapperBoundary::End(pos) => {
+                    saw_closed_wrapper = true;
+                    cursor = pos + end_token.len();
+                }
+                WrapperBoundary::Start(pos) => {
+                    saw_unclosed_wrapper = true;
+                    cursor = pos;
+                }
+                WrapperBoundary::None => {
+                    saw_unclosed_wrapper = true;
+                    break;
                 }
             }
-            None
+            continue;
         }
-        Err(_) => None,
+
+        let mut stream =
+            serde_json::Deserializer::from_str(trimmed_body).into_iter::<Box<RawValue>>();
+        match stream.next() {
+            Some(Ok(raw)) => {
+                let raw_json = raw.get();
+                let after_raw = &trimmed_body[raw_json.len()..];
+                let after_raw_trimmed = after_raw.trim_start();
+                let raw_trailing_ws = after_raw.len() - after_raw_trimmed.len();
+                if after_raw_trimmed.starts_with(end_token) {
+                    values.push(raw_json.to_string());
+                    cursor = json_pos + raw_json.len() + raw_trailing_ws + end_token.len();
+                    saw_closed_wrapper = true;
+                } else if allow_eof_recovery && after_raw_trimmed.trim().is_empty() {
+                    values.push(raw_json.to_string());
+                    break;
+                } else {
+                    match next_wrapper_boundary(input, body_pos, start_token, end_token) {
+                        WrapperBoundary::End(pos) => {
+                            saw_closed_wrapper = true;
+                            cursor = pos + end_token.len();
+                        }
+                        WrapperBoundary::Start(pos) => {
+                            saw_unclosed_wrapper = true;
+                            cursor = pos;
+                        }
+                        WrapperBoundary::None => {
+                            saw_unclosed_wrapper = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => {
+                let boundary = next_wrapper_boundary(input, body_pos, start_token, end_token);
+                if allow_eof_recovery {
+                    let repair_candidate = match boundary {
+                        WrapperBoundary::End(end_pos) => Some(input[json_pos..end_pos].trim()),
+                        WrapperBoundary::None => Some(trimmed_body),
+                        WrapperBoundary::Start(_) => None,
+                    };
+                    if let Some(candidate) = repair_candidate
+                        && let Some(repaired) = try_repair_truncated_json(candidate)
+                        && serde_json::from_str::<Box<RawValue>>(&repaired).is_ok()
+                    {
+                        values.push(repaired);
+                        if let WrapperBoundary::End(end_pos) = boundary {
+                            saw_closed_wrapper = true;
+                            cursor = end_pos + end_token.len();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                match boundary {
+                    WrapperBoundary::End(pos) => {
+                        saw_closed_wrapper = true;
+                        cursor = pos + end_token.len();
+                    }
+                    WrapperBoundary::Start(pos) => {
+                        saw_unclosed_wrapper = true;
+                        cursor = pos;
+                    }
+                    WrapperBoundary::None => {
+                        saw_unclosed_wrapper = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if values.len() == 1 {
+        Some(values.remove(0))
+    } else if !values.is_empty() {
+        Some(format!("[{}]", values.join(",")))
+    } else if saw_closed_wrapper {
+        Some(String::new())
+    } else if saw_start && !saw_unclosed_wrapper {
+        Some(String::new())
+    } else {
+        None
+    }
+}
+
+enum WrapperBoundary {
+    End(usize),
+    Start(usize),
+    None,
+}
+
+fn next_wrapper_boundary(
+    input: &str,
+    search_from: usize,
+    start_token: &str,
+    end_token: &str,
+) -> WrapperBoundary {
+    let tail = &input[search_from..];
+    let next_start = tail.find(start_token).map(|pos| search_from + pos);
+    let next_end = tail.find(end_token).map(|pos| search_from + pos);
+    match (next_start, next_end) {
+        (Some(start), Some(end)) if start < end => WrapperBoundary::Start(start),
+        (_, Some(end)) => WrapperBoundary::End(end),
+        (Some(start), None) => WrapperBoundary::Start(start),
+        (None, None) => WrapperBoundary::None,
     }
 }
 
@@ -294,6 +469,7 @@ pub fn try_tool_call_parse_basic_json(
     let mut json = trimmed.to_string();
     let mut normal_text = trimmed.to_string();
     let mut found_start_token_with_no_valid_json = false;
+    let mut extracted_marker_wrapped_content = false;
 
     // First, check if ANY start token exists in the input. `bare_json_mode`
     // short-circuits this to false so we always take the no-marker branch.
@@ -301,6 +477,7 @@ pub fn try_tool_call_parse_basic_json(
         && tool_call_start_tokens
             .iter()
             .any(|token| !token.is_empty() && normal_text.contains(token));
+    let has_marker_token = !config.bare_json_mode && contains_marker_token(trimmed, config);
 
     if !has_start_token {
         // No start tokens found, try to extract JSON directly. Everything that starts with { or [ is considered a potential JSON.
@@ -309,7 +486,12 @@ pub fn try_tool_call_parse_basic_json(
             let extracted_json = normal_text[idx..].trim().to_string();
             if !extracted_json.is_empty() {
                 normal_text = extracted_normal;
-                json = extracted_json;
+                json = if config.recover_orphan_end_token && has_marker_token {
+                    strip_trailing_end_tokens(&extracted_json, tool_call_end_tokens)
+                        .unwrap_or(extracted_json)
+                } else {
+                    extracted_json
+                };
             }
         }
     } else {
@@ -339,13 +521,19 @@ pub fn try_tool_call_parse_basic_json(
                             json = content;
                             // For single token case, use the normal text we extracted earlier
                             normal_text = new_normal_text;
+                            extracted_marker_wrapped_content = true;
 
                             break 'outer; // Found content, exit early
                         }
                     }
                     (false, false) => {
                         // Start and end token case
-                        let mut result = extract_tool_call_content(&json, start_token, end_token);
+                        let mut result = extract_tool_call_content(
+                            &json,
+                            start_token,
+                            end_token,
+                            config.allow_eof_recovery,
+                        );
                         // EOF recovery: only when explicitly opted in (finalize
                         // path). Streaming jails leave `allow_eof_recovery=false`
                         // so the parser doesn't claim a complete call before
@@ -365,6 +553,7 @@ pub fn try_tool_call_parse_basic_json(
 
                             json = content;
                             normal_text = new_normal_text;
+                            extracted_marker_wrapped_content = true;
 
                             break 'outer; // Found content, exit early
                         }
@@ -393,6 +582,16 @@ pub fn try_tool_call_parse_basic_json(
                 arguments: args.get().to_string(),
             },
         })
+    };
+    let parse_empty_args = |name: String| -> ToolCallResponse {
+        ToolCallResponse {
+            id: format!("call-{}", Uuid::new_v4()),
+            tp: ToolCallType::Function,
+            function: CalledFunction {
+                name,
+                arguments: "{}".to_string(),
+            },
+        }
     };
 
     // CalledFunctionParameters: Single { name, parameters }
@@ -424,6 +623,10 @@ pub fn try_tool_call_parse_basic_json(
             vec![parse(single.name, &single.arguments)?],
             Some(normal_text),
         ));
+    } else if let Ok(single) = serde_json::from_str::<CalledFunctionNameOnly>(json)
+        && tool_allows_empty_arguments(&single.name, _tools)
+    {
+        return Ok((vec![parse_empty_args(single.name)], Some(normal_text)));
 
     // Vec<CalledFunctionParameters> or Vec<CalledFunctionArguments>: Array of tool calls
     // Example:
@@ -446,6 +649,10 @@ pub fn try_tool_call_parse_basic_json(
                 serde_json::from_str::<CalledFunctionParameters>(item_str)
             {
                 results.push(parse(func_params.name, &func_params.parameters)?);
+            } else if let Ok(func_name) = serde_json::from_str::<CalledFunctionNameOnly>(item_str)
+                && tool_allows_empty_arguments(&func_name.name, _tools)
+            {
+                results.push(parse_empty_args(func_name.name));
             }
             // Skip malformed entries silently
         }
@@ -471,6 +678,10 @@ pub fn try_tool_call_parse_basic_json(
                 vec![parse(single.name, &single.arguments)?],
                 Some(normal_text),
             ));
+        } else if let Ok(single) = serde_json::from_str::<CalledFunctionNameOnly>(repaired)
+            && tool_allows_empty_arguments(&single.name, _tools)
+        {
+            return Ok((vec![parse_empty_args(single.name)], Some(normal_text)));
         } else if let Ok(array) = serde_json::from_str::<Vec<Box<RawValue>>>(repaired) {
             let mut results = Vec::new();
             for item in array {
@@ -481,6 +692,11 @@ pub fn try_tool_call_parse_basic_json(
                     serde_json::from_str::<CalledFunctionParameters>(item_str)
                 {
                     results.push(parse(func_params.name, &func_params.parameters)?);
+                } else if let Ok(func_name) =
+                    serde_json::from_str::<CalledFunctionNameOnly>(item_str)
+                    && tool_allows_empty_arguments(&func_name.name, _tools)
+                {
+                    results.push(parse_empty_args(func_name.name));
                 }
             }
             if !results.is_empty() {
@@ -491,7 +707,9 @@ pub fn try_tool_call_parse_basic_json(
 
     // If we found a start token but no valid JSON, return empty content
     // to avoid leaking the token and invalid JSON content
-    if found_start_token_with_no_valid_json {
+    if found_start_token_with_no_valid_json || extracted_marker_wrapped_content {
+        Ok((vec![], Some(normal_text)))
+    } else if has_marker_token {
         Ok((vec![], Some(String::new())))
     } else {
         Ok((vec![], Some(trimmed.to_string())))
