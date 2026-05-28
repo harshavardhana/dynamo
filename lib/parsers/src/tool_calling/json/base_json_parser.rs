@@ -118,14 +118,29 @@ fn extract_tool_call_content(
         if !(trimmed_body.starts_with('{') || trimmed_body.starts_with('[')) {
             match next_wrapper_boundary(input, body_pos, start_token, end_token) {
                 WrapperBoundary::End(pos) => {
+                    tracing::warn!(
+                        why = "non_json_wrapper_body",
+                        skipped_bytes = pos.saturating_sub(body_pos),
+                        "JSON tool-call recovery: skipped malformed marker wrapper whose body did not start with JSON."
+                    );
                     saw_closed_wrapper = true;
                     cursor = pos + end_token.len();
                 }
                 WrapperBoundary::Start(pos) => {
+                    tracing::warn!(
+                        why = "non_json_wrapper_body_resync",
+                        skipped_bytes = pos.saturating_sub(body_pos),
+                        "JSON tool-call recovery: skipped malformed marker wrapper and resynchronized at the next start token."
+                    );
                     saw_unclosed_wrapper = true;
                     cursor = pos;
                 }
                 WrapperBoundary::None => {
+                    tracing::warn!(
+                        why = "non_json_wrapper_body_no_boundary",
+                        skipped_bytes = body.len(),
+                        "JSON tool-call recovery: suppressed malformed marker wrapper with no later boundary."
+                    );
                     saw_unclosed_wrapper = true;
                     break;
                 }
@@ -146,19 +161,39 @@ fn extract_tool_call_content(
                     cursor = json_pos + raw_json.len() + raw_trailing_ws + end_token.len();
                     saw_closed_wrapper = true;
                 } else if allow_eof_recovery && after_raw_trimmed.trim().is_empty() {
+                    tracing::warn!(
+                        why = "missing_end_token",
+                        recovered_bytes = raw_json.len(),
+                        "JSON tool-call recovery: accepted complete JSON at EOF because end token was missing."
+                    );
                     values.push(raw_json.to_string());
                     break;
                 } else {
                     match next_wrapper_boundary(input, body_pos, start_token, end_token) {
                         WrapperBoundary::End(pos) => {
+                            tracing::warn!(
+                                why = "invalid_trailing_wrapper_bytes",
+                                skipped_bytes = pos.saturating_sub(body_pos),
+                                "JSON tool-call recovery: skipped marker wrapper with bytes after the JSON body before the end token."
+                            );
                             saw_closed_wrapper = true;
                             cursor = pos + end_token.len();
                         }
                         WrapperBoundary::Start(pos) => {
+                            tracing::warn!(
+                                why = "invalid_trailing_wrapper_bytes_resync",
+                                skipped_bytes = pos.saturating_sub(body_pos),
+                                "JSON tool-call recovery: skipped marker wrapper with invalid trailing bytes and resynchronized at the next start token."
+                            );
                             saw_unclosed_wrapper = true;
                             cursor = pos;
                         }
                         WrapperBoundary::None => {
+                            tracing::warn!(
+                                why = "invalid_trailing_wrapper_bytes_no_boundary",
+                                skipped_bytes = body.len(),
+                                "JSON tool-call recovery: suppressed marker wrapper with invalid trailing bytes and no later boundary."
+                            );
                             saw_unclosed_wrapper = true;
                             break;
                         }
@@ -177,6 +212,12 @@ fn extract_tool_call_content(
                         && let Some(repaired) = try_repair_truncated_json(candidate)
                         && serde_json::from_str::<Box<RawValue>>(&repaired).is_ok()
                     {
+                        tracing::warn!(
+                            why = "truncated_json_repaired",
+                            original_bytes = candidate.len(),
+                            repaired_bytes = repaired.len(),
+                            "JSON tool-call recovery: repaired truncated JSON before parsing tool call."
+                        );
                         values.push(repaired);
                         if let WrapperBoundary::End(end_pos) = boundary {
                             saw_closed_wrapper = true;
@@ -188,14 +229,29 @@ fn extract_tool_call_content(
                 }
                 match boundary {
                     WrapperBoundary::End(pos) => {
+                        tracing::warn!(
+                            why = "malformed_json_wrapper",
+                            skipped_bytes = pos.saturating_sub(body_pos),
+                            "JSON tool-call recovery: skipped marker wrapper whose JSON body could not be parsed or repaired."
+                        );
                         saw_closed_wrapper = true;
                         cursor = pos + end_token.len();
                     }
                     WrapperBoundary::Start(pos) => {
+                        tracing::warn!(
+                            why = "malformed_json_wrapper_resync",
+                            skipped_bytes = pos.saturating_sub(body_pos),
+                            "JSON tool-call recovery: skipped malformed JSON wrapper and resynchronized at the next start token."
+                        );
                         saw_unclosed_wrapper = true;
                         cursor = pos;
                     }
                     WrapperBoundary::None => {
+                        tracing::warn!(
+                            why = "malformed_json_wrapper_no_boundary",
+                            skipped_bytes = body.len(),
+                            "JSON tool-call recovery: suppressed malformed JSON wrapper with no later boundary."
+                        );
                         saw_unclosed_wrapper = true;
                         break;
                     }
@@ -485,8 +541,19 @@ pub fn try_tool_call_parse_basic_json(
             if !extracted_json.is_empty() {
                 normal_text = extracted_normal;
                 json = if config.recover_orphan_end_token && has_marker_token {
-                    strip_trailing_end_tokens(&extracted_json, tool_call_end_tokens)
-                        .unwrap_or(extracted_json)
+                    if let Some(stripped) =
+                        strip_trailing_end_tokens(&extracted_json, tool_call_end_tokens)
+                    {
+                        tracing::warn!(
+                            why = "orphan_end_token",
+                            original_bytes = extracted_json.len(),
+                            stripped_bytes = extracted_json.len().saturating_sub(stripped.len()),
+                            "JSON tool-call recovery: stripped trailing orphan end token before parsing raw JSON."
+                        );
+                        stripped
+                    } else {
+                        extracted_json
+                    }
                 } else {
                     extracted_json
                 };
@@ -541,6 +608,13 @@ pub fn try_tool_call_parse_basic_json(
                             && json.contains(start_token.as_str())
                         {
                             result = extract_tool_call_content_eof_recovery(&json, start_token);
+                            if let Some(content) = result.as_ref() {
+                                tracing::warn!(
+                                    why = "missing_end_token_eof_fallback",
+                                    recovered_bytes = content.len(),
+                                    "JSON tool-call recovery: treated EOF as the end token after wrapper extraction failed."
+                                );
+                            }
                         }
                         if let Some(content) = result {
                             // Check if we found a start token but got empty JSON back
@@ -666,12 +740,22 @@ pub fn try_tool_call_parse_basic_json(
         && let Some(repaired) = try_repair_truncated_json(json)
     {
         let repaired = repaired.as_str();
+        let log_truncated_json_repair = || {
+            tracing::warn!(
+                why = "truncated_json_repaired_parse_retry",
+                original_bytes = json.len(),
+                repaired_bytes = repaired.len(),
+                "JSON tool-call recovery: repaired truncated JSON after the initial parse failed."
+            );
+        };
         if let Ok(single) = serde_json::from_str::<CalledFunctionParameters>(repaired) {
+            log_truncated_json_repair();
             return Ok((
                 vec![parse(single.name, &single.parameters)?],
                 Some(normal_text),
             ));
         } else if let Ok(single) = serde_json::from_str::<CalledFunctionArguments>(repaired) {
+            log_truncated_json_repair();
             return Ok((
                 vec![parse(single.name, &single.arguments)?],
                 Some(normal_text),
@@ -679,6 +763,7 @@ pub fn try_tool_call_parse_basic_json(
         } else if let Ok(single) = serde_json::from_str::<CalledFunctionNameOnly>(repaired)
             && tool_allows_empty_arguments(&single.name, _tools)
         {
+            log_truncated_json_repair();
             return Ok((vec![parse_empty_args(single.name)], Some(normal_text)));
         } else if let Ok(array) = serde_json::from_str::<Vec<Box<RawValue>>>(repaired) {
             let mut results = Vec::new();
@@ -698,6 +783,7 @@ pub fn try_tool_call_parse_basic_json(
                 }
             }
             if !results.is_empty() {
+                log_truncated_json_repair();
                 return Ok((results, Some(normal_text)));
             }
         }
@@ -706,8 +792,16 @@ pub fn try_tool_call_parse_basic_json(
     // If we found a start token but no valid JSON, return empty content
     // to avoid leaking the token and invalid JSON content
     if found_start_token_with_no_valid_json || extracted_marker_wrapped_content {
+        tracing::warn!(
+            why = "marker_wrapped_content_unparseable",
+            "JSON tool-call recovery: suppressed marker-wrapped content that did not parse as a supported tool-call shape."
+        );
         Ok((vec![], Some(normal_text)))
     } else if has_marker_token {
+        tracing::warn!(
+            why = "marker_token_without_parse",
+            "JSON tool-call recovery: suppressed tool marker tokens that did not produce a valid tool call."
+        );
         Ok((vec![], Some(String::new())))
     } else {
         Ok((vec![], Some(trimmed.to_string())))
