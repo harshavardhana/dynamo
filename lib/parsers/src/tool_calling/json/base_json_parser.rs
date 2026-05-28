@@ -208,9 +208,7 @@ fn extract_tool_call_content(
         Some(values.remove(0))
     } else if !values.is_empty() {
         Some(format!("[{}]", values.join(",")))
-    } else if saw_closed_wrapper {
-        Some(String::new())
-    } else if saw_start && !saw_unclosed_wrapper {
+    } else if saw_closed_wrapper || (saw_start && !saw_unclosed_wrapper) {
         Some(String::new())
     } else {
         None
