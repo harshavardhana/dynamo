@@ -54,6 +54,24 @@ pub struct JsonParserConfig {
     /// tokens. This is opt-in because most grammars require an opening marker.
     #[serde(default)]
     pub recover_orphan_end_token: bool,
+
+    /// Treat `{"name": ...}` as an empty-argument tool call when the tool
+    /// schema allows no required arguments. This is opt-in because most
+    /// established parser families require an explicit arguments object.
+    #[serde(default)]
+    pub allow_name_only_tool_calls: bool,
+
+    /// Use JSON-aware wrapper extraction that can skip malformed wrappers and
+    /// resynchronize at the next start marker. This is opt-in because older
+    /// parser families have recorded behavior for malformed framed content.
+    #[serde(default)]
+    pub recover_malformed_wrappers: bool,
+
+    /// Suppress family marker tokens when parsing fails instead of returning
+    /// them as normal text. This should be enabled only when the family grammar
+    /// is known and marker leaks are never useful user-visible content.
+    #[serde(default)]
+    pub suppress_marker_tokens_on_parse_failure: bool,
 }
 
 impl Default for JsonParserConfig {
@@ -69,6 +87,9 @@ impl Default for JsonParserConfig {
             bare_json_mode: false,
             allow_eof_recovery: false,
             recover_orphan_end_token: false,
+            allow_name_only_tool_calls: false,
+            recover_malformed_wrappers: false,
+            suppress_marker_tokens_on_parse_failure: false,
         }
     }
 }
@@ -431,6 +452,9 @@ impl ToolCallConfig {
                     "<|action_end|>".to_string(),
                 ],
                 recover_orphan_end_token: true,
+                allow_name_only_tool_calls: true,
+                recover_malformed_wrappers: true,
+                suppress_marker_tokens_on_parse_failure: true,
                 ..Default::default()
             }),
             structural_tag_builder: None,

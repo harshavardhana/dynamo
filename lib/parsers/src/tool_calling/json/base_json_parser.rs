@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use regex::RegexBuilder;
 use serde_json::{Value, value::RawValue};
 use uuid::Uuid;
 
@@ -90,11 +91,44 @@ fn strip_trailing_end_tokens(input: &str, end_tokens: &[String]) -> Option<Strin
     }
 }
 
+// Legacy extraction for established JSON parser families. Keep this behavior
+// stable unless a family opts into JSON-aware wrapper recovery.
+fn extract_tool_call_content_regex(
+    input: &str,
+    start_token: &str,
+    end_token: &str,
+) -> Option<String> {
+    let escaped_start = regex::escape(start_token);
+    let escaped_end = regex::escape(end_token);
+    let pattern = format!(r"{}(.*?){}", escaped_start, escaped_end);
+
+    match RegexBuilder::new(&pattern)
+        .dot_matches_new_line(true)
+        .build()
+    {
+        Ok(regex) => {
+            let matches: Vec<_> = regex
+                .captures_iter(input)
+                .filter_map(|captures| captures.get(1))
+                .map(|m| m.as_str().trim().to_string())
+                .collect();
+            if matches.is_empty() {
+                None
+            } else if matches.len() == 1 {
+                matches.last().cloned()
+            } else {
+                Some(format!("[{}]", matches.join(",")))
+            }
+        }
+        Err(_) => None,
+    }
+}
+
 // Extract complete JSON values after each start token. This deliberately uses a
 // JSON parser instead of a `start(.*?)end` regex so marker-looking text inside a
 // JSON string is treated as data, and so a malformed wrapper can be skipped
 // before resynchronizing on a later valid wrapper.
-fn extract_tool_call_content(
+fn extract_tool_call_content_with_recovery(
     input: &str,
     start_token: &str,
     end_token: &str,
@@ -593,12 +627,16 @@ pub fn try_tool_call_parse_basic_json(
                     }
                     (false, false) => {
                         // Start and end token case
-                        let mut result = extract_tool_call_content(
-                            &json,
-                            start_token,
-                            end_token,
-                            config.allow_eof_recovery,
-                        );
+                        let mut result = if config.recover_malformed_wrappers {
+                            extract_tool_call_content_with_recovery(
+                                &json,
+                                start_token,
+                                end_token,
+                                config.allow_eof_recovery,
+                            )
+                        } else {
+                            extract_tool_call_content_regex(&json, start_token, end_token)
+                        };
                         // EOF recovery: only when explicitly opted in (finalize
                         // path). Streaming jails leave `allow_eof_recovery=false`
                         // so the parser doesn't claim a complete call before
@@ -695,7 +733,8 @@ pub fn try_tool_call_parse_basic_json(
             vec![parse(single.name, &single.arguments)?],
             Some(normal_text),
         ));
-    } else if let Ok(single) = serde_json::from_str::<CalledFunctionNameOnly>(json)
+    } else if config.allow_name_only_tool_calls
+        && let Ok(single) = serde_json::from_str::<CalledFunctionNameOnly>(json)
         && tool_allows_empty_arguments(&single.name, _tools)
     {
         return Ok((vec![parse_empty_args(single.name)], Some(normal_text)));
@@ -721,7 +760,8 @@ pub fn try_tool_call_parse_basic_json(
                 serde_json::from_str::<CalledFunctionParameters>(item_str)
             {
                 results.push(parse(func_params.name, &func_params.parameters)?);
-            } else if let Ok(func_name) = serde_json::from_str::<CalledFunctionNameOnly>(item_str)
+            } else if config.allow_name_only_tool_calls
+                && let Ok(func_name) = serde_json::from_str::<CalledFunctionNameOnly>(item_str)
                 && tool_allows_empty_arguments(&func_name.name, _tools)
             {
                 results.push(parse_empty_args(func_name.name));
@@ -760,7 +800,8 @@ pub fn try_tool_call_parse_basic_json(
                 vec![parse(single.name, &single.arguments)?],
                 Some(normal_text),
             ));
-        } else if let Ok(single) = serde_json::from_str::<CalledFunctionNameOnly>(repaired)
+        } else if config.allow_name_only_tool_calls
+            && let Ok(single) = serde_json::from_str::<CalledFunctionNameOnly>(repaired)
             && tool_allows_empty_arguments(&single.name, _tools)
         {
             log_truncated_json_repair();
@@ -775,8 +816,8 @@ pub fn try_tool_call_parse_basic_json(
                     serde_json::from_str::<CalledFunctionParameters>(item_str)
                 {
                     results.push(parse(func_params.name, &func_params.parameters)?);
-                } else if let Ok(func_name) =
-                    serde_json::from_str::<CalledFunctionNameOnly>(item_str)
+                } else if config.allow_name_only_tool_calls
+                    && let Ok(func_name) = serde_json::from_str::<CalledFunctionNameOnly>(item_str)
                     && tool_allows_empty_arguments(&func_name.name, _tools)
                 {
                     results.push(parse_empty_args(func_name.name));
@@ -791,13 +832,23 @@ pub fn try_tool_call_parse_basic_json(
 
     // If we found a start token but no valid JSON, return empty content
     // to avoid leaking the token and invalid JSON content
-    if found_start_token_with_no_valid_json || extracted_marker_wrapped_content {
+    if found_start_token_with_no_valid_json {
+        tracing::warn!(
+            why = "marker_wrapped_content_unparseable",
+            "JSON tool-call recovery: suppressed marker-wrapped content that did not parse as a supported tool-call shape."
+        );
+        if config.suppress_marker_tokens_on_parse_failure {
+            Ok((vec![], Some(normal_text)))
+        } else {
+            Ok((vec![], Some(String::new())))
+        }
+    } else if config.suppress_marker_tokens_on_parse_failure && extracted_marker_wrapped_content {
         tracing::warn!(
             why = "marker_wrapped_content_unparseable",
             "JSON tool-call recovery: suppressed marker-wrapped content that did not parse as a supported tool-call shape."
         );
         Ok((vec![], Some(normal_text)))
-    } else if has_marker_token {
+    } else if config.suppress_marker_tokens_on_parse_failure && has_marker_token {
         tracing::warn!(
             why = "marker_token_without_parse",
             "JSON tool-call recovery: suppressed tool marker tokens that did not produce a valid tool call."

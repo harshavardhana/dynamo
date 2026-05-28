@@ -1177,6 +1177,51 @@ Okay, the user is asking for the weather in San Francisco in Fahrenheit. Let me 
     }
 
     #[tokio::test]
+    async fn test_legacy_json_parser_preserves_malformed_marker_wrapped_text() {
+        let input = r#"<tool_call>not json</tool_call>"#;
+
+        let (result, content) = detect_and_parse_tool_call(input, Some("hermes"), None)
+            .await
+            .unwrap();
+
+        assert!(result.is_empty());
+        assert_eq!(content, Some(input.to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_legacy_json_parser_rejects_name_only_tool_call() {
+        let input = r#"<tool_call>{"name": "get_time"}</tool_call>"#;
+        let tools = vec![ToolDefinition {
+            name: "get_time".to_string(),
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": {},
+            })),
+            strict: None,
+        }];
+
+        let (result, content) = detect_and_parse_tool_call(input, Some("hermes"), Some(&tools))
+            .await
+            .unwrap();
+
+        assert!(result.is_empty());
+        assert_eq!(content, Some(input.to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_legacy_single_token_parser_drops_prefix_on_parse_failure() {
+        let input = r#"I'll fetch both cities now.
+functools[{"name": "get_weather", "arguments": {"location": "Boston"}}, {"name": "get_weather", "arguments": {"location": "New York"}"#;
+
+        let (result, content) = try_tool_call_parse(input, &ToolCallConfig::phi4(), None)
+            .await
+            .unwrap();
+
+        assert!(result.is_empty());
+        assert_eq!(content, Some(String::new()));
+    }
+
+    #[tokio::test]
     #[ignore]
     async fn test_internlm_internlm2_5_7b_chat_simple() {
         let input = r#"San Francisco's weather is known for its mild climate with plenty of fog, especially along the coast. Here's an overview of the weather in Fahrenheit:
