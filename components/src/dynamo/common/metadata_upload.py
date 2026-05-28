@@ -31,7 +31,7 @@ async def _upload_bytes(url: str, storage_path: str, data: bytes) -> str:
         from dynamo.common.storage import get_fs, upload_to_fs
     except ImportError as exc:
         raise RuntimeError(
-            "SGLang metadata upload requires fsspec support. "
+            "Metadata upload requires fsspec support. "
             "Install fsspec and the backend extra, for example `fsspec[s3]` for S3."
         ) from exc
 
@@ -43,8 +43,8 @@ def _serialize_zstd_json(payload: dict[str, Any]) -> bytes:
         import zstandard as zstd
     except ImportError as exc:
         raise RuntimeError(
-            "SGLang metadata upload requires zstandard. "
-            "Install ai-dynamo[sglang] or add the zstandard package."
+            "Metadata upload requires zstandard. "
+            "Install ai-dynamo with the selected backend extra or add the zstandard package."
         ) from exc
 
     raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode(

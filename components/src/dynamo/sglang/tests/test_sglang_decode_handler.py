@@ -14,7 +14,7 @@ from dynamo.sglang.request_handlers.llm.decode_handler import (
     _openai_stop_sampling_params,
     _user_stop_token_ids,
 )
-from dynamo.sglang.metadata_upload import (
+from dynamo.common.metadata_upload import (
     MetadataUploader,
 )
 from dynamo.sglang.request_handlers.multimodal.worker_handler import StreamProcessor

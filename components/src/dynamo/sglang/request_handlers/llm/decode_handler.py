@@ -18,7 +18,7 @@ from dynamo.sglang._compat import filter_supported_async_generate_kwargs
 from dynamo.sglang.args import Config
 from dynamo.sglang.publisher import DynamoSglangPublisher
 from dynamo.sglang.request_handlers.handler_base import BaseWorkerHandler
-from dynamo.sglang.metadata_upload import (
+from dynamo.common.metadata_upload import (
     ChoiceMetadata,
     MetadataUploader,
 )

@@ -21,7 +21,7 @@ from dynamo._internal import ModelDeploymentCard
 from dynamo.frontend.frontend_args import FrontendConfig
 from dynamo.llm import ModelCardInstanceId, PythonAsyncEngine, RoutedEngine, fetch_model
 from dynamo.llm.exceptions import InvalidArgument, Unknown
-from dynamo.sglang.metadata_upload import metadata_upload_requested
+from dynamo.common.metadata_upload import metadata_upload_requested
 
 from .sglang_prepost import (
     SglangStreamingPostProcessor,
