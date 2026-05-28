@@ -879,6 +879,19 @@ impl JailedStream {
         first_marker.map(|pos| &content[..pos])
     }
 
+    fn first_parser_tool_call_marker_pos(&self, content: &str) -> Option<usize> {
+        let parser_name = self.tool_call_parser.as_deref()?;
+        let config = get_tool_parser_map().get(parser_name)?;
+
+        config
+            .parser_config
+            .tool_call_start_tokens()
+            .iter()
+            .filter(|marker| !marker.is_empty())
+            .filter_map(|marker| content.find(marker))
+            .min()
+    }
+
     /// Check if accumulated content should end jail
     async fn should_end_jail(&self, accumulated_content: &str) -> (bool, usize) {
         match &self.jail_mode {
@@ -1085,6 +1098,17 @@ impl JailedStream {
                                 .unwrap_or("")
                         } else if normal_text.as_deref() == Some("") {
                             ""
+                        } else if normal_text.as_deref() == Some(accumulated_content)
+                            && let Some(parser_marker_pos) =
+                                self.first_parser_tool_call_marker_pos(accumulated_content)
+                            && let Some(prefix) =
+                                self.prefix_before_first_tool_call_marker(accumulated_content)
+                            && prefix.len() <= parser_marker_pos
+                        {
+                            // Some batch parsers intentionally preserve malformed marker-wrapped
+                            // text as normal_text for legacy compatibility. Streaming jail is a
+                            // user-visible boundary, so do not release those markers.
+                            prefix
                         } else if is_harmony_parser(self.tool_call_parser.as_deref())
                             && contains_harmony_protocol(accumulated_content)
                         {
