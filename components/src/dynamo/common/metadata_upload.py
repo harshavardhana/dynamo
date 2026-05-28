@@ -8,22 +8,14 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+_DEFAULT_FORMAT = "msgpack"
+_FORMATS = {"json", "msgpack"}
 
-def _upload_url_from_request(request: dict[str, Any]) -> str | None:
-    scopes = [request.get("nvext")]
-    extra_args = request.get("extra_args")
-    if isinstance(extra_args, dict):
-        scopes.append(extra_args.get("nvext"))
 
-    for scope in scopes:
-        if not isinstance(scope, dict):
-            continue
-        candidate = scope.get("metadata_upload")
-        if isinstance(candidate, dict):
-            url = candidate.get("url")
-            if isinstance(url, str) and url.strip():
-                return url.strip()
-    return None
+def _backend_metadata_upload_settings(request: dict[str, Any]) -> dict[str, Any] | None:
+    extra_args = request.get("extra_args") or {}
+    extra_nvext = extra_args.get("nvext") or {}
+    return extra_nvext.get("metadata_upload")
 
 
 async def _upload_bytes(url: str, storage_path: str, data: bytes) -> str:
@@ -38,7 +30,7 @@ async def _upload_bytes(url: str, storage_path: str, data: bytes) -> str:
     return await upload_to_fs(get_fs(url), storage_path, data)
 
 
-def _serialize_zstd_json(payload: dict[str, Any]) -> bytes:
+def _serialize_payload(payload: dict[str, Any], payload_format: str) -> bytes:
     try:
         import zstandard as zstd
     except ImportError as exc:
@@ -47,9 +39,17 @@ def _serialize_zstd_json(payload: dict[str, Any]) -> bytes:
             "Install ai-dynamo with the selected backend extra or add the zstandard package."
         ) from exc
 
-    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode(
-        "utf-8"
-    )
+    if payload_format == "json":
+        raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode(
+            "utf-8"
+        )
+    else:
+        try:
+            import msgspec
+        except ImportError as exc:
+            raise RuntimeError("Metadata msgpack upload requires msgspec.") from exc
+        raw = msgspec.msgpack.encode(payload)
+
     try:
         return zstd.ZstdCompressor().compress(raw)
     finally:
@@ -101,28 +101,41 @@ class ChoiceMetadata:
 @dataclass(frozen=True)
 class MetadataUploader:
     url: str
+    payload_format: str = _DEFAULT_FORMAT
+
+    def __post_init__(self) -> None:
+        url = self.url.strip()
+        if not url:
+            raise ValueError("metadata_upload.url must not be empty")
+
+        payload_format = self.payload_format.strip().lower()
+        if payload_format not in _FORMATS:
+            raise ValueError("metadata_upload.format must be one of: json, msgpack")
+        object.__setattr__(self, "url", url)
+        object.__setattr__(self, "payload_format", payload_format)
 
     @classmethod
-    def from_request(cls, request: dict[str, Any]) -> MetadataUploader | None:
-        url = _upload_url_from_request(request)
-        return cls(url=url) if url is not None else None
+    def from_settings(cls, settings: dict[str, Any] | None) -> MetadataUploader | None:
+        if not settings or not settings.get("url"):
+            return None
+        return cls(
+            url=settings["url"],
+            payload_format=settings.get("format", _DEFAULT_FORMAT),
+        )
 
-    async def upload_choice(self, choice: ChoiceMetadata) -> dict[str, Any] | None:
+    @classmethod
+    def from_backend_request(cls, request: dict[str, Any]) -> MetadataUploader | None:
+        return cls.from_settings(_backend_metadata_upload_settings(request))
+
+    async def upload_choice(self, choice: ChoiceMetadata) -> None:
         if not choice.has_payload():
             return None
 
-        storage_path = f"choice_{choice.choice_index}.json.zst"
+        storage_path = f"choice_{choice.choice_index}.{self.payload_format}.zst"
         payload = choice.to_payload()
-        data = await asyncio.to_thread(_serialize_zstd_json, payload)
+        data = await asyncio.to_thread(_serialize_payload, payload, self.payload_format)
         try:
-            url = await _upload_bytes(self.url, storage_path, data)
+            await _upload_bytes(self.url, storage_path, data)
         finally:
             del data
             del payload
-        return {
-            "url": url,
-        }
-
-
-def metadata_upload_requested(request: dict[str, Any]) -> bool:
-    return _upload_url_from_request(request) is not None

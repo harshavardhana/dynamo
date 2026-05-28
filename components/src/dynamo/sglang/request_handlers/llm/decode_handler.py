@@ -66,17 +66,9 @@ def _extract_media_urls(mm_data: Dict[str, Any], media_key: str) -> list[str] | 
 
 
 def _nvext_extra_field_requested(request: Dict[str, Any], field: str) -> bool:
-    nvext = request.get("nvext")
-    if not isinstance(nvext, dict):
-        extra_args = request.get("extra_args")
-        if isinstance(extra_args, dict):
-            nvext = extra_args.get("nvext")
-    if not isinstance(nvext, dict):
-        return False
-    extra_fields = nvext.get("extra_fields")
-    if not isinstance(extra_fields, list):
-        return False
-    return field in extra_fields
+    extra_args = request.get("extra_args") or {}
+    nvext = extra_args.get("nvext") or {}
+    return field in (nvext.get("extra_fields") or [])
 
 
 def _release_large_meta_info_refs(meta_info: dict[str, Any]) -> None:
@@ -233,7 +225,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
     ) -> MetadataUploader | None:
         if not getattr(getattr(self.config, "dynamo_args", None), "enable_rl", False):
             return None
-        return MetadataUploader.from_request(request)
+        return MetadataUploader.from_backend_request(request)
 
     def cleanup(self) -> None:
         """Shutdown the engine and cleanup resources."""
@@ -706,9 +698,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                         and choice_metadata is not None
                     ):
                         try:
-                            metadata_ref = await metadata_uploader.upload_choice(
-                                choice_metadata
-                            )
+                            await metadata_uploader.upload_choice(choice_metadata)
                         finally:
                             choice_metadata.release_payload()
                             metadata_per_choice.pop(output_idx, None)
@@ -717,8 +707,6 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                             log_probs = None
                             top_logprobs = None
                             routed_experts = None
-                        if metadata_ref is not None:
-                            out["engine_data"] = {"sglang_metadata": metadata_ref}
                 if metadata_uploader is not None:
                     _release_large_meta_info_refs(meta_info)
                     log_probs = None
@@ -825,18 +813,12 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     and choice_metadata is not None
                 ):
                     try:
-                        metadata_ref = await metadata_uploader.upload_choice(
-                            choice_metadata
-                        )
+                        await metadata_uploader.upload_choice(choice_metadata)
                     finally:
                         choice_metadata.release_payload()
                         metadata_per_choice.pop(index, None)
                         _release_large_meta_info_refs(meta_info)
                         routed_experts = None
-                    if metadata_ref is not None:
-                        response_nvext["engine_data"] = {
-                            "sglang_metadata": metadata_ref
-                        }
                 if metadata_uploader is not None:
                     _release_large_meta_info_refs(meta_info)
                     routed_experts = None

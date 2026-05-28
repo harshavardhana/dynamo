@@ -21,7 +21,6 @@ from dynamo._internal import ModelDeploymentCard
 from dynamo.frontend.frontend_args import FrontendConfig
 from dynamo.llm import ModelCardInstanceId, PythonAsyncEngine, RoutedEngine, fetch_model
 from dynamo.llm.exceptions import InvalidArgument, Unknown
-from dynamo.common.metadata_upload import metadata_upload_requested
 
 from .sglang_prepost import (
     SglangStreamingPostProcessor,
@@ -251,14 +250,13 @@ def _build_dynamo_preproc(
     if mm_data:
         preproc["multi_modal_data"] = mm_data
 
-    nvext = request.get("nvext")
-    if isinstance(nvext, dict):
-        nvext_passthrough: dict[str, Any] = {}
-        for key in ("metadata_upload", "extra_fields"):
-            if key in nvext:
-                nvext_passthrough[key] = nvext[key]
-        if nvext_passthrough:
-            preproc["extra_args"] = {"nvext": nvext_passthrough}
+    # Backend preproc carries nvext passthrough in extra_args, matching Rust.
+    nvext = request.get("nvext") or {}
+    nvext_passthrough = {
+        key: nvext[key] for key in ("metadata_upload", "extra_fields") if key in nvext
+    }
+    if nvext_passthrough:
+        preproc["extra_args"] = {"nvext": nvext_passthrough}
 
     return preproc
 
@@ -562,7 +560,6 @@ class SglangProcessor:
                             response_nvext["stop_reason"] = stop_reason
                         if engine_data is not None and (
                             nvext_extra_field_requested(request, "engine_data")
-                            or metadata_upload_requested(request)
                         ):
                             response_nvext["engine_data"] = engine_data
                         if response_nvext:
