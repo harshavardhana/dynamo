@@ -7,7 +7,7 @@ use dynamo_protocols::types::{
     ChatCompletionStreamResponseDelta, FinishReason, FunctionCallStream, FunctionType, Role,
 };
 
-use dynamo_parsers::tool_calling::config::JsonParserConfig;
+use dynamo_parsers::tool_calling::config::{JsonParserConfig, ParserConfig};
 use dynamo_parsers::tool_calling::json::try_tool_call_parse_basic_json;
 use dynamo_parsers::tool_calling::parsers::get_tool_parser_map;
 use dynamo_parsers::tool_calling::{
@@ -892,6 +892,22 @@ impl JailedStream {
             .min()
     }
 
+    fn suppress_parser_markers_on_parse_failure(&self) -> bool {
+        let Some(parser_name) = self.tool_call_parser.as_deref() else {
+            return false;
+        };
+        let Some(config) = get_tool_parser_map().get(parser_name) else {
+            return false;
+        };
+
+        match &config.parser_config {
+            ParserConfig::Json(config) | ParserConfig::Harmony(config) => {
+                config.suppress_marker_tokens_on_parse_failure
+            }
+            _ => false,
+        }
+    }
+
     /// Check if accumulated content should end jail
     async fn should_end_jail(&self, accumulated_content: &str) -> (bool, usize) {
         match &self.jail_mode {
@@ -1098,16 +1114,16 @@ impl JailedStream {
                                 .unwrap_or("")
                         } else if normal_text.as_deref() == Some("") {
                             ""
-                        } else if normal_text.as_deref() == Some(accumulated_content)
+                        } else if self.suppress_parser_markers_on_parse_failure()
+                            && normal_text.as_deref() == Some(accumulated_content)
                             && let Some(parser_marker_pos) =
                                 self.first_parser_tool_call_marker_pos(accumulated_content)
                             && let Some(prefix) =
                                 self.prefix_before_first_tool_call_marker(accumulated_content)
                             && prefix.len() <= parser_marker_pos
                         {
-                            // Some batch parsers intentionally preserve malformed marker-wrapped
-                            // text as normal_text for legacy compatibility. Streaming jail is a
-                            // user-visible boundary, so do not release those markers.
+                            // Only opt-in parsers suppress marker-looking text here. Legacy parser
+                            // families intentionally preserve malformed wrapped content as text.
                             prefix
                         } else if is_harmony_parser(self.tool_call_parser.as_deref())
                             && contains_harmony_protocol(accumulated_content)
