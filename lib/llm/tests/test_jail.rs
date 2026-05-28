@@ -531,13 +531,14 @@ mod tests {
             Some("Normal text ")
         );
 
-        // Second chunk should contain the accumulated jailed content
+        // The parser-aware path suppresses malformed tool markup instead of
+        // releasing raw marker text to the client.
         let jailed = results[1].data.as_ref().unwrap().inner.choices[0]
             .delta
             .content
             .as_ref()
             .expect("Expected accumulated jailed content");
-        assert!(extract_text(jailed).contains("<jail><TOOLCALL>Jailed content</jail>"));
+        assert_eq!(extract_text(jailed), "");
     }
 
     #[tokio::test]
@@ -897,7 +898,8 @@ mod tests {
     async fn test_jailed_stream_malformed_tool_call() {
         // Tests graceful handling of malformed JSON within tool call markers
         // Input: "Let me call a function. " + "<TOOLCALL>[{\"name\": \"broken_func\", \"arguments\": {\"param\": incomplete</TOOLCALL>" + " Function call attempt finished."
-        // Expected output: 3 chunks [Content(), Content(malformed), Content()] - parser fails gracefully
+        // Expected output: 3 chunks [Content(), Content(""), Content()] - parser fails gracefully
+        // without leaking malformed marker text.
         let chunks = vec![
             create_mock_response_chunk("Let me call a function. ".to_string(), 0),
             create_mock_response_chunk("<TOOLCALL>".to_string(), 0),
@@ -923,19 +925,18 @@ mod tests {
             "Should handle malformed JSON gracefully and jail appropriately"
         );
 
-        // Verify exact output structure: [Content(), Content(complete jailed content)]
+        // Verify exact output structure: [Content(), suppressed marker content, Content()]
         test_utils::assert_content(&results[0], "Let me call a function. ");
-        test_utils::assert_content(
-            &results[1],
-            "<TOOLCALL>[{\"name\": \"broken_func\", \"arguments\": {\"param\": incomplete</TOOLCALL>",
-        );
+        test_utils::assert_content(&results[1], "");
 
-        // Verify malformed content is preserved as text (including markers when parsing fails)
+        // Verify malformed tool-call markup is suppressed rather than exposed as text.
         let reconstructed = test_utils::reconstruct_content(&results);
         assert_eq!(
             reconstructed,
-            "Let me call a function. <TOOLCALL>[{\"name\": \"broken_func\", \"arguments\": {\"param\": incomplete</TOOLCALL> Function call attempt finished."
+            "Let me call a function.  Function call attempt finished."
         );
+        assert!(!reconstructed.contains("<TOOLCALL>"));
+        assert!(!reconstructed.contains("broken_func"));
     }
 
     #[tokio::test]
@@ -1333,18 +1334,12 @@ mod tests {
             "Inner response created should carry forward from real stream chunks, not be 0"
         );
 
-        // Verify accumulated content is returned
+        // Verify accumulated malformed tool-call content is suppressed while
+        // preserving the stream metadata above.
         let content = &inner.inner.choices[0].delta.content;
         assert!(content.is_some(), "Should have accumulated content");
         let content = content.as_ref().unwrap();
-        assert!(
-            test_utils::extract_text(content).contains("<tool_call>"),
-            "Should contain jail start marker in accumulated content"
-        );
-        assert!(
-            test_utils::extract_text(content).contains("incomplete_call"),
-            "Should contain accumulated incomplete content"
-        );
+        assert_eq!(test_utils::extract_text(content), "");
     }
 
     #[tokio::test]
