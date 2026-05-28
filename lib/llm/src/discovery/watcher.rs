@@ -474,23 +474,31 @@ impl ModelWatcher {
                     self.manager
                         .deactivate_prefill_router_for_decode(&model_name, worker_namespace);
                 }
-                Some(WorkerType::Encode) => {
-                    // Encode workers don't participate in the prefill/decode
-                    // activator state machine. Skip the decode waiter cleanup
-                    // — that map is keyed by (model, namespace) and clearing
-                    // it on an unrelated encode removal could drop a live
-                    // DecodeWaiting and recreate the stale-prefill-router
-                    // rebuild failure described above.
+                Some(WorkerType::Encode) if card.model_type.is_empty() => {
+                    // A surface-less encode helper (e.g. vLLM) never ran the
+                    // model_type pipeline chain, so it created no prefill/decode
+                    // activator state. Skip the decode waiter cleanup — that map
+                    // is keyed by (model, namespace) and clearing it on an
+                    // unrelated encode removal could drop a live DecodeWaiting
+                    // and recreate the stale-prefill-router rebuild failure
+                    // described above.
                 }
-                Some(WorkerType::Decode) | Some(WorkerType::Aggregated) | None => {
-                    // Decode-component teardown: always run the waiter cleanup,
-                    // regardless of whether `remove_worker_set` found an entry. If
-                    // a decode worker registered (creating a `DecodeWaiting`
-                    // activator entry) but `handle_add_helper` later failed before
-                    // `add_worker_set`, the WorkerSet is absent here yet the stale
-                    // `DecodeWaiting` still needs to be cleared. The helper is
-                    // state-safe (`remove_if(|_, v| matches!(v, DecodeWaiting(_)))`)
-                    // so calling it on a key that's vacant or holds `PrefillReady`
+                Some(WorkerType::Decode)
+                | Some(WorkerType::Aggregated)
+                | Some(WorkerType::Encode)
+                | None => {
+                    // Decode-component teardown — and any surface-bearing worker
+                    // that built a pipeline via the model_type chain (including
+                    // an sglang multimodal encode front door, which registers a
+                    // prefill router just like a decode worker): always run the
+                    // waiter cleanup, regardless of whether `remove_worker_set`
+                    // found an entry. If a decode worker registered (creating a
+                    // `DecodeWaiting` activator entry) but `handle_add_helper`
+                    // later failed before `add_worker_set`, the WorkerSet is
+                    // absent here yet the stale `DecodeWaiting` still needs to be
+                    // cleared. The helper is state-safe
+                    // (`remove_if(|_, v| matches!(v, DecodeWaiting(_)))`) so
+                    // calling it on a key that's vacant or holds `PrefillReady`
                     // is a no-op.
                     self.manager
                         .remove_decode_prefill_waiter(&model_name, worker_namespace);
@@ -745,17 +753,18 @@ impl ModelWatcher {
         let mut worker_set = WorkerSet::new(namespace.clone(), checksum.to_string(), card.clone());
         worker_set.set_instance_watcher(instance_watcher);
 
-        // worker_type-driven short circuits.
+        // worker_type-driven short circuit for Prefill.
         //
-        // Prefill and Encode workers carry no OpenAI-style engine: prefill
-        // does its own thing through the dedicated prefill router, encode
-        // exists purely for model-serving-readiness accounting. We dispatch
-        // them off `worker_type` here, *before* falling into the
-        // model_type-based branches that build chat / completions /
-        // embedding / tensor / images / videos / audios pipelines — those
-        // would otherwise try to build a regular pipeline for a prefill or
-        // encode card and either fail (no tokenizer) or produce a routed
-        // engine that nobody calls.
+        // A prefill worker carries no OpenAI-style engine — it is reached only
+        // through the dedicated prefill router, never by the frontend — so we
+        // dispatch it off `worker_type` here, *before* the model_type-based
+        // branches below. Everything else is routed by its OpenAI surface: a
+        // card that declares a surface builds the matching pipeline (so an
+        // sglang multimodal encode worker, which fronts the model, serves like
+        // any other worker), while a surface-less (`ModelType::empty()`) card
+        // is registered for serving-readiness only (see the `is_empty()` arm at
+        // the end of the chain). The role is carried by `worker_type`; serving
+        // is driven by `model_type`.
         if card.worker_type == Some(WorkerType::Prefill) {
             // Guardrail: prefill workers still expect Tokens input downstream.
             if card.model_input != ModelInput::Tokens {
@@ -802,24 +811,6 @@ impl ModelWatcher {
                 "Prefill worker registered and router activated successfully"
             );
 
-            return Ok(());
-        }
-
-        if card.worker_type == Some(WorkerType::Encode) {
-            // Encode workers don't serve OpenAI traffic; they exist on the
-            // model only so the serving-readiness gate sees them. No engine,
-            // no prefill-router handshake.
-            tracing::info!(
-                model_name = card.name(),
-                "Encode worker detected, registering for serving readiness only"
-            );
-
-            self.manager
-                .add_worker_set(card.name(), &ws_key, worker_set);
-
-            if let Some(tx) = &self.model_update_tx {
-                tx.send(ModelUpdate::Added(card.clone())).await.ok();
-            }
             return Ok(());
         }
 
@@ -1183,11 +1174,22 @@ impl ModelWatcher {
             )
             .await?;
             worker_set.realtime_engine = Some(Arc::new(realtime_router));
+        } else if card.model_type.is_empty() {
+            // No OpenAI surface declared: a topology-only worker that exists
+            // purely for serving-readiness accounting — e.g. a surface-less
+            // encode helper, or an internal disaggregated worker fronted by
+            // another worker (reached over RPC, never by the frontend). Build
+            // no pipeline; the shared tail below registers the engine-less
+            // WorkerSet so the readiness gate counts it. (Prefill is handled by
+            // its own branch above.)
+            tracing::info!(
+                model_name = card.name(),
+                "Topology-only worker (empty model_type), registering for serving readiness only"
+            );
         } else {
-            // Reject unsupported combinations. Prefill / Encode workers are
-            // routed off `worker_type` above, *before* this chain — anything
-            // that reaches this `else` is a real Decode / Aggregated worker
-            // with an invalid `(model_input, model_type)` combo.
+            // A worker that declares an OpenAI surface but with an incompatible
+            // model_input. (Surface-less workers hit the `is_empty()` arm above;
+            // prefill is routed off `worker_type`.)
             anyhow::bail!(
                 "Unsupported model configuration: {} with {} input. Supported combinations: \
                 Tokens+(Chat|Completions), Text+(Chat|Completions|Images|Audios|Videos|Embeddings|Realtime), \
@@ -1279,16 +1281,6 @@ impl ModelWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery::WorkerSet;
-    use crate::model_card::ModelDeploymentCard;
-
-    fn make_worker_set(namespace: &str) -> WorkerSet {
-        WorkerSet::new(
-            namespace.to_string(),
-            "test-checksum".to_string(),
-            ModelDeploymentCard::default(),
-        )
-    }
 
     #[test]
     fn test_is_model_type_list_empty_on_empty_manager() {

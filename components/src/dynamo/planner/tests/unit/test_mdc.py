@@ -221,7 +221,7 @@ class TestSelectEntry:
     def test_selects_prefill_entry(self):
         entries = [
             MdcEntry(card_json={**_card(), "model_type": 2}, component="backend"),
-            MdcEntry(card_json={**_card(), "model_type": 16}, component="prefill"),
+            MdcEntry(card_json=_card(worker_type="prefill"), component="prefill"),
         ]
         hit = select_entry(entries, SubComponentType.PREFILL)
         assert hit is not None
@@ -230,7 +230,7 @@ class TestSelectEntry:
     def test_selects_decode_entry(self):
         entries = [
             MdcEntry(card_json={**_card(), "model_type": 2}, component="backend"),
-            MdcEntry(card_json={**_card(), "model_type": 16}, component="prefill"),
+            MdcEntry(card_json=_card(worker_type="prefill"), component="prefill"),
         ]
         hit = select_entry(entries, SubComponentType.DECODE)
         assert hit is not None

@@ -322,27 +322,33 @@ fn register_model<'p>(
         ));
     };
 
-    // Prefill / Encode workers carry no OpenAI surface; both still expect
-    // Tokens input downstream (engines preprocess externally) and must
-    // register with an empty `ModelType`.
+    // Prefill and Encode workers receive pre-tokenized requests (their engines
+    // preprocess externally), so both require `ModelInput::Tokens`.
     if matches!(
         worker_type_unwrapped,
         WorkerType::Prefill | WorkerType::Encode
-    ) {
-        if !matches!(model_input, ModelInput::Tokens) {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "register_model: worker_type={:?} requires model_input=ModelInput::Tokens",
-                worker_type_unwrapped
-            )));
-        }
-        if !model_type.inner.is_empty() {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "register_model: worker_type={:?} requires model_type=ModelType.Empty \
-                 (the prefill/encode role is carried by worker_type; ModelType only \
-                 describes the OpenAI surface, which these workers don't expose)",
-                worker_type_unwrapped
-            )));
-        }
+    ) && !matches!(model_input, ModelInput::Tokens)
+    {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "register_model: worker_type={:?} requires model_input=ModelInput::Tokens",
+            worker_type_unwrapped
+        )));
+    }
+
+    // Prefill workers never expose an OpenAI surface — they are reached only
+    // through the dedicated prefill router, never by the frontend — so they
+    // must register with an empty `ModelType`. Encode workers MAY carry a
+    // surface: an sglang multimodal encode worker is the OpenAI front door
+    // that delegates generation to an internal worker, whereas a vLLM-style
+    // encode helper registers Empty. Serving is driven by `ModelType` (the
+    // OpenAI surface); the topology role is carried by `worker_type`.
+    if matches!(worker_type_unwrapped, WorkerType::Prefill) && !model_type.inner.is_empty() {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "register_model: worker_type={:?} requires model_type=ModelType.Empty \
+             (the prefill role is carried by worker_type; ModelType only describes \
+             the OpenAI surface, which prefill workers don't expose)",
+            worker_type_unwrapped
+        )));
     }
 
     let model_input = match model_input {

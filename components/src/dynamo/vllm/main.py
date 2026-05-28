@@ -602,7 +602,7 @@ async def register_vllm_model(
     config: Config,
     engine_client: AsyncLLM,
     vllm_config: VllmConfig,
-    worker_type: WorkerType | None = None,
+    worker_type: WorkerType,
     needs: list[list[WorkerType]] | None = None,
 ) -> None:
     """
