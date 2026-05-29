@@ -70,9 +70,7 @@ async def _register_model_with_runtime_config(
         input_type: Expected model input type. Defaults to ModelInput.Tokens.
         output_type: Expected model output type. Defaults to ModelType.Chat | ModelType.Completions.
         worker_type: Topology role of this worker (Prefill/Decode/Encode/Aggregated).
-            Callers must pass an explicit value; `None` is accepted only so the
-            optional kwarg can flow through the wrapper unchanged. Registration
-            with `None` is rejected by the Rust binding.
+            Required (keyword-only); the Rust binding rejects a missing `worker_type`.
         needs: DNF list of peer roles this worker requires to serve. Empty (or
             `None`) means no peer dependency, which is the correct value for
             Aggregated workers.
@@ -280,6 +278,11 @@ async def _get_runtime_config(
     runtime_config.exclude_tools_when_tool_choice_none = (
         dynamo_args.exclude_tools_when_tool_choice_none
     )
+    runtime_config.set_structural_tag_mode(
+        "on" if dynamo_args.dyn_enable_structural_tag else "off"
+    )
+    runtime_config.set_structural_tag_scope(dynamo_args.dyn_structural_tag_scope)
+    runtime_config.set_structural_tag_schema(dynamo_args.dyn_structural_tag_schema)
     # Decode workers don't create the WorkerKvQuery endpoint, so don't advertise local indexer
     is_decode_worker = server_args.disaggregation_mode == "decode"
     runtime_config.enable_local_indexer = (
