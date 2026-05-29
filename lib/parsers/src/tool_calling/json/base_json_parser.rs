@@ -672,19 +672,18 @@ pub fn try_tool_call_parse_basic_json(
                         // path). Streaming jails leave `allow_eof_recovery=false`
                         // so the parser doesn't claim a complete call before
                         // the end-token has actually arrived.
-                        if result.is_none() && config.allow_eof_recovery {
-                            if let Some((_, eof_start_token)) =
+                        if result.is_none()
+                            && config.allow_eof_recovery
+                            && let Some((_, eof_start_token)) =
                                 find_next_start_token(&json, 0, tool_call_start_tokens)
-                            {
-                                result =
-                                    extract_tool_call_content_eof_recovery(&json, eof_start_token);
-                                if let Some(content) = result.as_ref() {
-                                    tracing::warn!(
-                                        why = "missing_end_token_eof_fallback",
-                                        recovered_bytes = content.len(),
-                                        "JSON tool-call recovery: treated EOF as the end token after wrapper extraction failed."
-                                    );
-                                }
+                        {
+                            result = extract_tool_call_content_eof_recovery(&json, eof_start_token);
+                            if let Some(content) = result.as_ref() {
+                                tracing::warn!(
+                                    why = "missing_end_token_eof_fallback",
+                                    recovered_bytes = content.len(),
+                                    "JSON tool-call recovery: treated EOF as the end token after wrapper extraction failed."
+                                );
                             }
                         }
                         if let Some(content) = result {
