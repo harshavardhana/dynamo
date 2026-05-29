@@ -16,6 +16,7 @@ pub struct JsonParserConfig {
     /// Marker tokens that belong to the family grammar but are not complete
     /// tool-call start tokens by themselves. If parsing fails, these markers
     /// should still be suppressed rather than leaked as normal text.
+    #[serde(default)]
     pub tool_call_sentinel_tokens: Vec<String>,
     /// Separator tokens between function name and arguments
     /// (e.g., "<｜tool▁sep｜>" for DeepSeek v3.1)
@@ -710,6 +711,19 @@ mod tests {
         assert_eq!(cfg.block_start, "<｜DSML｜function_calls>");
         assert_eq!(cfg.block_end, "</｜DSML｜function_calls>");
         assert_eq!(cfg.invoke_start_prefix, "<｜DSML｜invoke name=");
+    }
+
+    #[test]
+    fn json_config_deserializes_without_sentinel_tokens() {
+        let legacy = serde_json::json!({
+            "tool_call_start_tokens": ["<tool_call>"],
+            "tool_call_end_tokens": ["</tool_call>"],
+            "tool_call_separator_tokens": [],
+            "function_name_keys": ["name"],
+            "arguments_keys": ["arguments"],
+        });
+        let cfg: JsonParserConfig = serde_json::from_value(legacy).unwrap();
+        assert!(cfg.tool_call_sentinel_tokens.is_empty());
     }
 
     #[test]

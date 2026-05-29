@@ -170,11 +170,13 @@ fn extract_tool_call_content_with_recovery(
                     cursor = pos;
                 }
                 WrapperBoundary::None => {
-                    tracing::warn!(
-                        why = "non_json_wrapper_body_no_boundary",
-                        skipped_bytes = body.len(),
-                        "JSON tool-call recovery: suppressed malformed marker wrapper with no later boundary."
-                    );
+                    if allow_eof_recovery {
+                        tracing::warn!(
+                            why = "non_json_wrapper_body_no_boundary",
+                            skipped_bytes = body.len(),
+                            "JSON tool-call recovery: suppressed malformed marker wrapper with no later boundary."
+                        );
+                    }
                     saw_unclosed_wrapper = true;
                     break;
                 }
@@ -223,11 +225,13 @@ fn extract_tool_call_content_with_recovery(
                             cursor = pos;
                         }
                         WrapperBoundary::None => {
-                            tracing::warn!(
-                                why = "invalid_trailing_wrapper_bytes_no_boundary",
-                                skipped_bytes = body.len(),
-                                "JSON tool-call recovery: suppressed marker wrapper with invalid trailing bytes and no later boundary."
-                            );
+                            if allow_eof_recovery {
+                                tracing::warn!(
+                                    why = "invalid_trailing_wrapper_bytes_no_boundary",
+                                    skipped_bytes = body.len(),
+                                    "JSON tool-call recovery: suppressed marker wrapper with invalid trailing bytes and no later boundary."
+                                );
+                            }
                             saw_unclosed_wrapper = true;
                             break;
                         }
@@ -281,11 +285,13 @@ fn extract_tool_call_content_with_recovery(
                         cursor = pos;
                     }
                     WrapperBoundary::None => {
-                        tracing::warn!(
-                            why = "malformed_json_wrapper_no_boundary",
-                            skipped_bytes = body.len(),
-                            "JSON tool-call recovery: suppressed malformed JSON wrapper with no later boundary."
-                        );
+                        if allow_eof_recovery {
+                            tracing::warn!(
+                                why = "malformed_json_wrapper_no_boundary",
+                                skipped_bytes = body.len(),
+                                "JSON tool-call recovery: suppressed malformed JSON wrapper with no later boundary."
+                            );
+                        }
                         saw_unclosed_wrapper = true;
                         break;
                     }
