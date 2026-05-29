@@ -108,28 +108,32 @@ fn find_internlm_tool_call_end_position(chunk: &str, config: &JsonParserConfig) 
         .collect();
     start_tokens.sort_by_key(|token| std::cmp::Reverse(token.len()));
 
-    let (first_start, first_token) = find_next_internlm_start(chunk, 0, &start_tokens)?;
-    let mut cursor = find_internlm_wrapper_end(chunk, first_start + first_token.len(), end_token)?;
+    let mut cursor = 0;
+    let mut last_complete_end = None;
 
     loop {
-        let rest = &chunk[cursor..];
-        let trimmed = rest.trim_start();
-        let trim_offset = rest.len() - trimmed.len();
-        let Some(start_token) = start_tokens
-            .iter()
-            .copied()
-            .find(|token| trimmed.starts_with(token))
+        let Some((start_pos, start_token)) = find_next_internlm_start(chunk, cursor, &start_tokens)
         else {
-            break;
+            return last_complete_end;
         };
-        let next_body = cursor + trim_offset + start_token.len();
-        let Some(next_cursor) = find_internlm_wrapper_end(chunk, next_body, end_token) else {
-            break;
-        };
-        cursor = next_cursor;
-    }
 
-    Some(cursor)
+        if last_complete_end.is_some() && !chunk[cursor..start_pos].chars().all(char::is_whitespace)
+        {
+            return last_complete_end;
+        }
+
+        let body_pos = start_pos + start_token.len();
+        let Some(end_pos) = find_internlm_wrapper_end(chunk, body_pos, end_token) else {
+            if last_complete_end.is_some() {
+                return last_complete_end;
+            }
+            cursor = body_pos;
+            continue;
+        };
+
+        last_complete_end = Some(end_pos);
+        cursor = end_pos;
+    }
 }
 
 fn find_next_internlm_start<'a>(
@@ -295,6 +299,21 @@ mod tests {
         assert_eq!(
             &input[pos..],
             r#"<|action_start|><|plugin|>{"name":"second","parameters":{"text":"partial <|action_end|>"#
+        );
+    }
+
+    #[test]
+    fn test_find_tool_call_end_position_internlm_resyncs_after_malformed_json_wrapper() {
+        let config = internlm_config();
+        let malformed = r#"<|action_start|><|plugin|>{"name":"broken"<|action_end|>"#;
+        let valid = r#"<|action_start|><|plugin|>{"name":"first","parameters":{}}<|action_end|>"#;
+        let input = format!("{malformed}{valid}<|action_start|><|plugin|>{{\"name\":\"second\"");
+
+        let pos = find_tool_call_end_position_json(&input, "internlm", &config);
+        assert_eq!(pos, malformed.len() + valid.len());
+        assert_eq!(
+            &input[pos..],
+            r#"<|action_start|><|plugin|>{"name":"second""#
         );
     }
 
