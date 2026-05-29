@@ -65,6 +65,20 @@ fn contains_marker_token(text: &str, config: &JsonParserConfig) -> bool {
         .any(|token| !token.is_empty() && text.contains(token))
 }
 
+fn strip_marker_tokens(input: &str, config: &JsonParserConfig) -> String {
+    let mut stripped = input.to_string();
+    for token in config
+        .tool_call_start_tokens
+        .iter()
+        .chain(config.tool_call_end_tokens.iter())
+        .chain(config.tool_call_sentinel_tokens.iter())
+        .filter(|token| !token.is_empty())
+    {
+        stripped = stripped.replace(token, "");
+    }
+    stripped.trim().to_string()
+}
+
 fn strip_trailing_end_tokens(input: &str, end_tokens: &[String]) -> Option<String> {
     let mut trimmed = input.trim_end();
     let mut changed = false;
@@ -600,7 +614,19 @@ pub fn try_tool_call_parse_basic_json(
             let extracted_normal = normal_text[..idx].trim().to_string();
             let extracted_json = normal_text[idx..].trim().to_string();
             if !extracted_json.is_empty() {
-                normal_text = extracted_normal;
+                normal_text = if config.suppress_marker_tokens_on_parse_failure && has_marker_token
+                {
+                    let stripped_normal = strip_marker_tokens(&extracted_normal, config);
+                    if stripped_normal != extracted_normal {
+                        tracing::warn!(
+                            why = "marker_prefix_before_recovered_raw_json",
+                            "JSON tool-call recovery: stripped marker tokens before recovered raw JSON."
+                        );
+                    }
+                    stripped_normal
+                } else {
+                    extracted_normal
+                };
                 json = if config.recover_orphan_end_token && has_marker_token {
                     if let Some(stripped) =
                         strip_trailing_end_tokens(&extracted_json, tool_call_end_tokens)
@@ -969,7 +995,13 @@ mod wrapper_recovery_tests {
                 "<|action_start|>".to_string(),
             ],
             tool_call_end_tokens: vec!["<|action_end|>".to_string()],
+            tool_call_sentinel_tokens: vec![
+                "<|action_start|>".to_string(),
+                "<|plugin|>".to_string(),
+                "<|action_end|>".to_string(),
+            ],
             recover_malformed_wrappers: true,
+            recover_orphan_end_token: true,
             suppress_marker_tokens_on_parse_failure: true,
             ..Default::default()
         }
@@ -996,6 +1028,21 @@ mod wrapper_recovery_tests {
             serde_json::from_str(&calls[1].function.arguments).unwrap();
         assert_eq!(first_args["city"], "NYC");
         assert_eq!(second_args["timezone"], "UTC");
+    }
+
+    #[test]
+    fn test_internlm_recovery_strips_sentinel_only_prefix() {
+        let config = internlm_recovery_config();
+        let input =
+            r#"<|plugin|>{"name":"get_weather","parameters":{"location":"NYC"}}<|action_end|>"#;
+
+        let (calls, normal_text) = try_tool_call_parse_basic_json(input, &config, None).unwrap();
+        assert_eq!(normal_text.as_deref(), Some(""));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["location"], "NYC");
     }
 }
 
