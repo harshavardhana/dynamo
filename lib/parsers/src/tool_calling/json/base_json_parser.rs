@@ -130,7 +130,7 @@ fn extract_tool_call_content_regex(
 // before resynchronizing on a later valid wrapper.
 fn extract_tool_call_content_with_recovery(
     input: &str,
-    start_token: &str,
+    start_tokens: &[String],
     end_token: &str,
     allow_eof_recovery: bool,
 ) -> Option<String> {
@@ -140,9 +140,8 @@ fn extract_tool_call_content_with_recovery(
     let mut saw_closed_wrapper = false;
     let mut saw_unclosed_wrapper = false;
 
-    while let Some(rel_start) = input[cursor..].find(start_token) {
+    while let Some((start_pos, start_token)) = find_next_start_token(input, cursor, start_tokens) {
         saw_start = true;
-        let start_pos = cursor + rel_start;
         let body_pos = start_pos + start_token.len();
         let body = &input[body_pos..];
         let trimmed_body = body.trim_start();
@@ -150,7 +149,7 @@ fn extract_tool_call_content_with_recovery(
         let json_pos = body_pos + leading_ws;
 
         if !(trimmed_body.starts_with('{') || trimmed_body.starts_with('[')) {
-            match next_wrapper_boundary(input, body_pos, start_token, end_token) {
+            match next_wrapper_boundary(input, body_pos, start_tokens, end_token) {
                 WrapperBoundary::End(pos) => {
                     tracing::warn!(
                         why = "non_json_wrapper_body",
@@ -205,7 +204,7 @@ fn extract_tool_call_content_with_recovery(
                     values.push(raw_json.to_string());
                     break;
                 } else {
-                    match next_wrapper_boundary(input, body_pos, start_token, end_token) {
+                    match next_wrapper_boundary(input, body_pos, start_tokens, end_token) {
                         WrapperBoundary::End(pos) => {
                             tracing::warn!(
                                 why = "invalid_trailing_wrapper_bytes",
@@ -239,7 +238,7 @@ fn extract_tool_call_content_with_recovery(
                 }
             }
             _ => {
-                let boundary = next_wrapper_boundary(input, body_pos, start_token, end_token);
+                let boundary = next_wrapper_boundary(input, body_pos, start_tokens, end_token);
                 if allow_eof_recovery {
                     let repair_candidate = match boundary {
                         WrapperBoundary::End(end_pos) => Some(input[json_pos..end_pos].trim()),
@@ -317,14 +316,30 @@ enum WrapperBoundary {
     None,
 }
 
+fn find_next_start_token<'a>(
+    input: &str,
+    search_from: usize,
+    start_tokens: &'a [String],
+) -> Option<(usize, &'a str)> {
+    start_tokens
+        .iter()
+        .filter(|token| !token.is_empty())
+        .filter_map(|token| {
+            input[search_from..]
+                .find(token)
+                .map(|pos| (search_from + pos, token.as_str()))
+        })
+        .min_by_key(|(pos, token)| (*pos, std::cmp::Reverse(token.len())))
+}
+
 fn next_wrapper_boundary(
     input: &str,
     search_from: usize,
-    start_token: &str,
+    start_tokens: &[String],
     end_token: &str,
 ) -> WrapperBoundary {
     let tail = &input[search_from..];
-    let next_start = tail.find(start_token).map(|pos| search_from + pos);
+    let next_start = find_next_start_token(input, search_from, start_tokens).map(|(pos, _)| pos);
     let next_end = tail.find(end_token).map(|pos| search_from + pos);
     match (next_start, next_end) {
         (Some(start), Some(end)) if start < end => WrapperBoundary::Start(start),
@@ -494,6 +509,12 @@ fn try_parse_normal_text(input: &str, start_token: &str) -> String {
     String::new()
 }
 
+fn try_parse_normal_text_from_tokens(input: &str, start_tokens: &[String]) -> String {
+    find_next_start_token(input, 0, start_tokens)
+        .map(|(idx, _)| input[..idx].trim().to_string())
+        .unwrap_or_default()
+}
+
 /// Attempts to parse a tool call from a raw LLM message string into a unified [`ToolCallResponse`] format.
 ///
 /// This is a flexible helper that handles a variety of potential formats emitted by LLMs for function/tool calls,
@@ -604,7 +625,11 @@ pub fn try_tool_call_parse_basic_json(
         // Try all combinations of start and end tokens
         'outer: for start_token in tool_call_start_tokens.iter() {
             for end_token in tool_call_end_tokens.iter() {
-                let new_normal_text = try_parse_normal_text(&normal_text, start_token);
+                let new_normal_text = if config.recover_malformed_wrappers {
+                    try_parse_normal_text_from_tokens(&normal_text, tool_call_start_tokens)
+                } else {
+                    try_parse_normal_text(&normal_text, start_token)
+                };
 
                 // Process based on token types
                 match (start_token.is_empty(), end_token.is_empty()) {
@@ -636,7 +661,7 @@ pub fn try_tool_call_parse_basic_json(
                         let mut result = if config.recover_malformed_wrappers {
                             extract_tool_call_content_with_recovery(
                                 &json,
-                                start_token,
+                                tool_call_start_tokens,
                                 end_token,
                                 config.allow_eof_recovery,
                             )
@@ -647,17 +672,19 @@ pub fn try_tool_call_parse_basic_json(
                         // path). Streaming jails leave `allow_eof_recovery=false`
                         // so the parser doesn't claim a complete call before
                         // the end-token has actually arrived.
-                        if result.is_none()
-                            && config.allow_eof_recovery
-                            && json.contains(start_token.as_str())
-                        {
-                            result = extract_tool_call_content_eof_recovery(&json, start_token);
-                            if let Some(content) = result.as_ref() {
-                                tracing::warn!(
-                                    why = "missing_end_token_eof_fallback",
-                                    recovered_bytes = content.len(),
-                                    "JSON tool-call recovery: treated EOF as the end token after wrapper extraction failed."
-                                );
+                        if result.is_none() && config.allow_eof_recovery {
+                            if let Some((_, eof_start_token)) =
+                                find_next_start_token(&json, 0, tool_call_start_tokens)
+                            {
+                                result =
+                                    extract_tool_call_content_eof_recovery(&json, eof_start_token);
+                                if let Some(content) = result.as_ref() {
+                                    tracing::warn!(
+                                        why = "missing_end_token_eof_fallback",
+                                        recovered_bytes = content.len(),
+                                        "JSON tool-call recovery: treated EOF as the end token after wrapper extraction failed."
+                                    );
+                                }
                             }
                         }
                         if let Some(content) = result {
@@ -929,6 +956,47 @@ mod repair_tests {
             "repaired must parse: {:?}",
             repaired
         );
+    }
+}
+
+#[cfg(test)]
+mod wrapper_recovery_tests {
+    use super::*;
+
+    fn internlm_recovery_config() -> JsonParserConfig {
+        JsonParserConfig {
+            tool_call_start_tokens: vec![
+                "<|action_start|><|plugin|>".to_string(),
+                "<|action_start|>".to_string(),
+            ],
+            tool_call_end_tokens: vec!["<|action_end|>".to_string()],
+            recover_malformed_wrappers: true,
+            suppress_marker_tokens_on_parse_failure: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_recovery_scans_mixed_internlm_start_tokens() {
+        let config = internlm_recovery_config();
+        let input = concat!(
+            "prefix ",
+            r#"<|action_start|><|plugin|>{"name":"get_weather","parameters":{"city":"NYC"}}<|action_end|>"#,
+            r#"<|action_start|>{"name":"current_time","parameters":{"timezone":"UTC"}}<|action_end|>"#
+        );
+
+        let (calls, normal_text) = try_tool_call_parse_basic_json(input, &config, None).unwrap();
+        assert_eq!(normal_text.as_deref(), Some("prefix"));
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[1].function.name, "current_time");
+
+        let first_args: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let second_args: serde_json::Value =
+            serde_json::from_str(&calls[1].function.arguments).unwrap();
+        assert_eq!(first_args["city"], "NYC");
+        assert_eq!(second_args["timezone"], "UTC");
     }
 }
 

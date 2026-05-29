@@ -165,6 +165,7 @@ fn find_internlm_wrapper_end(chunk: &str, body_pos: usize, end_token: &str) -> O
                 return Some(json_pos + raw_json.len() + raw_trailing_ws + end_token.len());
             }
         }
+        return None;
     }
 
     body.find(end_token)
@@ -277,6 +278,24 @@ mod tests {
         let pos = find_tool_call_end_position_json(&input, "internlm", &config);
         assert_eq!(pos, action.len());
         assert_eq!(&input[pos..], " done");
+    }
+
+    #[test]
+    fn test_find_tool_call_end_position_internlm_ignores_end_marker_inside_incomplete_json_string()
+    {
+        let config = internlm_config();
+        let complete =
+            r#"<|action_start|><|plugin|>{"name":"first","parameters":{}}<|action_end|>"#;
+        let input = format!(
+            "{complete}<|action_start|><|plugin|>{{\"name\":\"second\",\"parameters\":{{\"text\":\"partial <|action_end|>"
+        );
+
+        let pos = find_tool_call_end_position_json(&input, "internlm", &config);
+        assert_eq!(pos, complete.len());
+        assert_eq!(
+            &input[pos..],
+            r#"<|action_start|><|plugin|>{"name":"second","parameters":{"text":"partial <|action_end|>"#
+        );
     }
 
     // Recovery for missing outer </TOOLCALL> (max_tokens / EOS truncation):
